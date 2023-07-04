@@ -35,9 +35,14 @@ seq_len, feature_columns, d_model = get_features_dim(FD=FD)
 # FD003     |   20.34   |   0.1
 # FD004     |   27.85   |   0.5
 
-config = ModelConfig(num_attention_heads=4, hidden_size=16,
-                     intermediate_size=64, weight_bits=1,
-                     input_bits=1, num_hidden_layers=6, hidden_dropout_prob=0.1)
+config = ModelConfig(
+    num_attention_heads=4,
+    hidden_size=16,
+    intermediate_size=64,
+    weight_bits=1,
+    input_bits=1,
+    num_hidden_layers=6,
+    hidden_dropout_prob=0.1)
 model = Model(config).to(device)
 teacher = torch.load("./checkpoint/full/FD00" + FD + "/model.pt")
 

@@ -3,7 +3,7 @@ class ModelConfig:
                  num_attention_heads=3,
                  hidden_size=15,
                  input_bits=1,
-                 clip_val=1,
+                 clip_val=2.5,
                  quantize_act=True,
                  weight_bits=1,
                  attention_probs_dropout_prob=0.1,
@@ -15,6 +15,7 @@ class ModelConfig:
                  max_position_embeddings=30,
                  en_dropout=0.1,
                  initializer_range=0.02,
+                 device='cpu',
                  **kwargs):
         super(ModelConfig, self).__init__(**kwargs)
         self.num_attention_heads = num_attention_heads
@@ -32,3 +33,4 @@ class ModelConfig:
         self.max_position_embeddings = max_position_embeddings
         self.en_dropout = en_dropout
         self.initializer_range = initializer_range
+        self.device = device

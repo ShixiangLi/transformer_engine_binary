@@ -318,7 +318,7 @@ def run_distill_epoch(
                 # i: 本次epoch的第几个batch
                 # n_accum: 本次epoch更新了多少次模型参数
                 # lr: 学习率（learning rate），这里打印学习率的目的是看一下warmup下学习率的变化
-                % (i, n_accum, loss, elapsed, lr)
+                % (i, n_accum, torch.sqrt(loss)*125, elapsed, lr)
             )
             # 重置开始时间
             start = time.time()

@@ -48,8 +48,7 @@ class EncoderLayer(nn.Module):
         self.output = EncodeOutput(config)
 
     def forward(self, hidden_states, attention_mask, layer_num=0):
-        attention_output, layer_att, value_att, context_score, query_score, key_score = self.attention(hidden_states,
-                                                                                                       attention_mask)
+        attention_output, layer_att, value_att, context_score, query_score, key_score = self.attention(hidden_states, attention_mask)
         intermediate_output = self.intermediate(attention_output, layer_num=layer_num)
         layer_output = self.output(intermediate_output, attention_output, layer_num=layer_num)
 

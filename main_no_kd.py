@@ -13,7 +13,7 @@ from transformer.binary.config import ModelConfig
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-FD = '1'
+FD = '2'
 batch_size = 1024
 epochs = 1000
 patient = 100
@@ -24,7 +24,7 @@ seq_len, feature_columns, d_model = get_features_dim(FD=FD)
 # 32bits
 # Dataset   |   RMSE    |   Dropout
 # FD001     |   13.96   |   0.1
-# FD002     |   19.16   |   0.5
+# FD002     |   18.90   |   0.5
 # FD003     |   11.12   |   0.1
 # FD004     |   17.77   |   0.5
 
@@ -35,6 +35,13 @@ seq_len, feature_columns, d_model = get_features_dim(FD=FD)
 # FD003     |   19.02   |   0.1
 # FD004     |   24.54   |   0.5
 
+# 1bit_no_kd k_factor
+# Dataset   |   RMSE    |   Dropout
+# FD001     |   16.04   |   0.1
+# FD002     |   25.53   |   0.1
+# FD003     |   16.54   |   0.1
+# FD004     |   23.06   |   0.1
+
 config = ModelConfig(
     num_attention_heads=4,  # 多头注意力头数
     hidden_size=16,  # 特征维数
@@ -42,13 +49,13 @@ config = ModelConfig(
     weight_bits=1,  # 权重位数
     input_bits=1,  # 激活位数
     num_hidden_layers=6,  # Transformer Block数量
-    hidden_dropout_prob=0.1  # Dropout概率
+    hidden_dropout_prob=0,  # Dropout概率
+    device=device
 )
 model = Model(config).to(device)
-
 criterion = nn.MSELoss()
 optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
-lr_scheduler = StepLR(optimizer, step_size=2500, gamma=0.5)
+lr_scheduler = StepLR(optimizer, step_size=2000, gamma=0.5)
 
 for epoch in range(epochs):
     model.train()
@@ -78,13 +85,22 @@ for epoch in range(epochs):
     if rmse < rmse_test:
         rmse_test = rmse
         p = 0
-        torch.save(model, "./checkpoint/bin/" + "FD00" + FD + "/model.pt")
+        if config.weight_bits == 1:
+            print("FD00" + FD + " Epoch " + str(epoch) + " RMSE: " + str(rmse_test) + " Saving Model")
+            torch.save(model, "./checkpoint/bin/" + "FD00" + FD + "/model.pt")
+        else:
+            print("FD00" + FD + " Epoch " + str(epoch) + " RMSE: " + str(rmse_test) + " Saving Model")
+            torch.save(model, "./checkpoint/full/" + "FD00" + FD + "/model.pt")
     else:
         p += 1
     if p > patient:
         break
 
-model = torch.load("./checkpoint/bin/" + "FD00" + FD + "/model.pt")
+if config.weight_bits == 1:
+    model = torch.load("./checkpoint/bin/" + "FD00" + FD + "/model.pt")
+else:
+    model = torch.load("./checkpoint/full/" + "FD00" + FD + "/model.pt")
+
 model.eval()
 # for name, module in model.named_modules():
 #     if hasattr(module, 'weight_quantizer'):
@@ -97,8 +113,11 @@ model.eval()
 #                 module.weight_clip_val,
 #                 module.weight_bits, True,
 #                 module.type)
-feature, labels = get_data(FD=FD, feature_columns=feature_columns,
-                           sequence_length=seq_len, batch_size=batch_size, label='test')
+feature, labels = get_data(FD=FD,
+                           feature_columns=feature_columns,
+                           sequence_length=seq_len,
+                           batch_size=batch_size,
+                           label='test')
 feature = torch.tensor(feature)
 feature_mask = torch.ones(size=(feature.size(0), 1, seq_len))
 labels = torch.tensor(labels)

@@ -114,8 +114,7 @@ class MultiHeadedAttention(nn.Module):
         self.output = SelfOutput(config)
 
     def forward(self, input_tensor, attention_mask):
-        self_output, layer_att, value_att, context_score, query_scores, key_scores = self.self(input_tensor,
-                                                                                               attention_mask.unsqueeze(1))
+        self_output, layer_att, value_att, context_score, query_scores, key_scores = self.self(input_tensor, attention_mask.unsqueeze(1))
         attention_output = self.output(self_output, input_tensor)
         return attention_output, layer_att, value_att, context_score, query_scores, key_scores
 

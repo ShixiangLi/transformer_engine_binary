@@ -96,10 +96,15 @@ class SymQuantizer(torch.autograd.Function):
 
 
 class QuantizeLinear(nn.Linear):
-    def __init__(self, *kargs, bias=True, config=None, type=None):
+    def __init__(self, *kargs, config=None):
         super(QuantizeLinear, self).__init__(*kargs, bias=True)
         self.quantize_act = config.quantize_act
         self.weight_bits = config.weight_bits
+
+        # 用可学习的修正因子效果不如均值和斜率
+        # self.weight_k = nn.Parameter(torch.rand(size=(self.weight.size()[0], 1)), requires_grad=True).to(config.device)
+        # self.input_k = nn.Parameter(torch.Tensor([0.5]), requires_grad=True).to(config.device)
+
         if self.weight_bits == 1:
             self.weight_quantizer = BinaryQuantizer
         else:
@@ -114,7 +119,7 @@ class QuantizeLinear(nn.Linear):
             else:
                 self.act_quantizer = SymQuantizer
             self.register_buffer('act_clip_val', torch.tensor([-config.clip_val, config.clip_val]))
-        self.register_parameter('scale', Parameter(torch.Tensor([0.0]).squeeze()))
+        self.register_parameter('scale', Parameter(torch.Tensor([0.0, ]).squeeze()))
 
     def forward(self, input, type=None):
         if self.weight_bits == 1:
@@ -122,19 +127,22 @@ class QuantizeLinear(nn.Linear):
             scaling_factor = scaling_factor.detach()
             real_weights = self.weight - torch.mean(self.weight, dim=-1, keepdim=True)
             binary_weights_no_grad = torch.sign(real_weights) * scaling_factor
+            # binary_weights_no_grad = self.weight_quantizer.apply(real_weights) * scaling_factor
             cliped_weights = torch.clamp(real_weights, -1.0, 1.0)
             weight = binary_weights_no_grad.detach() - cliped_weights.detach() + cliped_weights
         else:
             weight = self.weight_quantizer.apply(self.weight, self.weight_clip_val, self.weight_bits, True)
 
         if self.input_bits == 1:
+            k = (torch.max(input) - torch.min(input)) / input.size()[1]
             binary_input_no_grad = torch.sign(input)
+            # binary_input_no_grad = self.act_quantizer.apply(input)
             cliped_input = torch.clamp(input, -1.0, 1.0)
             ba = binary_input_no_grad.detach() - cliped_input.detach() + cliped_input
         else:
             ba = self.act_quantizer.apply(input, self.act_clip_val, self.input_bits, True)
 
-        out = nn.functional.linear(ba, weight)
+        out = nn.functional.linear(ba, weight) * k
 
         if not self.bias is None:
             out += self.bias.view(1, -1).expand_as(out)

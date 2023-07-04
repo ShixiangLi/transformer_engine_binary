@@ -40,7 +40,7 @@ class Model(PreTrainedModel):
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
 
-        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+        # extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
         extended_attention_mask = attention_mask.to(dtype=next(self.parameters()).dtype)  # fp16 compatibility
         # extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
 

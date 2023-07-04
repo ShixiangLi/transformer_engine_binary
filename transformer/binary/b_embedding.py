@@ -18,10 +18,10 @@ class PositionalEncoding(nn.Module):
         position = torch.arange(0, self.max_len).unsqueeze(1)
         # 这里就是sin和cos括号中的内容，通过e和ln进行了变换
         div_term_1 = torch.exp(
-            torch.arange(0, self.d_model, 2) * -(math.log(30.0) / self.d_model)
+            torch.arange(0, self.d_model, 2) * -(math.log(float(config.time_steps)) / self.d_model)
         )
         div_term_2 = torch.exp(
-            torch.arange(1, self.d_model, 2) * -(math.log(30.0) / self.d_model)
+            torch.arange(1, self.d_model, 2) * -(math.log(float(config.time_steps)) / self.d_model)
         )
         # 计算PE(pos, 2i)
         pe[:, 0::2] = torch.sin(position * div_term_1)

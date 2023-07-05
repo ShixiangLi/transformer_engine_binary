@@ -23,10 +23,10 @@ seq_len, feature_columns, d_model = get_features_dim(FD=FD)
 
 # 32bits
 # Dataset   |   RMSE    |   Dropout
-# FD001     |   13.96   |   0.1
+# FD001     |   13.81   |   0.1
 # FD002     |   18.90   |   0.5
 # FD003     |   11.12   |   0.1
-# FD004     |   17.77   |   0.5
+# FD004     |   17.72   |   0.5
 
 # 1bit_no_kd
 # Dataset   |   RMSE    |   Dropout

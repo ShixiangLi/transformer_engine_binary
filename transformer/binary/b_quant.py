@@ -1,34 +1,25 @@
-import math
+# coding=utf-8
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
 
 import torch
-from torch import nn
-from torch.nn import Parameter
+import torch.nn as nn
+import logging
+import math
+import matplotlib.pyplot as plt
 
 
-def gelu(x):
-    """Implementation of the gelu activation function.
-        For information: OpenAI GPT's gelu is slightly different (and gives slightly different results):
-        0.5 * x * (1 + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * torch.pow(x, 3))))
-        Also see https://arxiv.org/abs/1606.08415
-    """
-    return x * 0.5 * (1.0 + torch.erf(x / math.sqrt(2.0)))
+class LearnableBias(nn.Module):
+    def __init__(self, out_chn):
+        super(LearnableBias, self).__init__()
+        self.bias = nn.Parameter(torch.zeros(out_chn), requires_grad=True)
 
-
-class BinaryQuantizer(torch.autograd.Function):
-
-    @staticmethod
-    def forward(ctx, input):
-        ctx.save_for_backward(input)
-        out = torch.sign(input)
+    def forward(self, x):
+        out = x + self.bias.expand_as(x)
         return out
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        input = ctx.saved_tensors
-        grad_input = grad_output.clone()
-        grad_input[input[0].ge(1)] = 0
-        grad_input[input[0].le(-1)] = 0
-        return grad_input
 
 
 class ZMeanBinaryQuantizer(torch.autograd.Function):
@@ -36,8 +27,11 @@ class ZMeanBinaryQuantizer(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input):
         ctx.save_for_backward(input)
-        out = torch.sign(input)
-        out[out == -1] = 0
+        input_max = input.max()
+        threshold = 0.25 * input_max
+        out = torch.where(input.abs() < threshold, torch.zeros_like(input), torch.ones_like(input))
+        # out = torch.sign(input)
+        # out[out == -1] = 0
         return out
 
     @staticmethod
@@ -45,106 +39,302 @@ class ZMeanBinaryQuantizer(torch.autograd.Function):
         input = ctx.saved_tensors
         grad_input = grad_output.clone()
         grad_input[input[0].ge(1)] = 0
-        grad_input[input[0].le(-1)] = 0
+        # grad_input[input[0].le(-1)] = 0
+        grad_input[input[0].le(0)] = 0
         return grad_input
 
 
-class SymQuantizer(torch.autograd.Function):
+class ElasticQuantBinarizerSigned(torch.autograd.Function):
     """
-        uniform quantization
+        Modified from Learned Step-size Quantization.
+        https://arxiv.org/abs/1902.08153
     """
 
     @staticmethod
-    def forward(ctx, input, clip_val, num_bits, layerwise, type=None):
+    def forward(ctx, input, alpha, num_bits, layerwise):
         """
-        :param ctx:
-        :param input: tensor to be quantized
-        :param clip_val: clip the tensor before quantization
-        :param quant_bits: number of bits
+        :param input: input to be quantized
+        :param alpha: the step size
+        :param num_bits: quantization bits
+        :param layerwise: rowwise quant
+        :return: quantized output
+        """
+        if not layerwise:
+            # TODO
+            raise NotImplementedError
+        ctx.num_bits = num_bits
+        if num_bits == 32:
+            return input
+
+        if num_bits == 1:
+            Qn = -1
+            Qp = 1
+        else:
+            Qn = -2 ** (num_bits - 1)
+            Qp = 2 ** (num_bits - 1) - 1
+
+        eps = torch.tensor(0.00001).float().to(alpha.device)
+        if alpha.item() == 1.0 and (not alpha.initialized):
+            alpha.initialize_wrapper(input, num_bits, symmetric=True, init_method='default')
+        alpha = torch.where(alpha > eps, alpha, eps)
+        assert alpha > 0, 'alpha = {:.6f} becomes non-positive'.format(alpha)
+
+        grad_scale = 1.0 / math.sqrt(input.numel()) if not Qp else 1.0 / math.sqrt(input.numel() * Qp)
+        ctx.save_for_backward(input, alpha)
+        ctx.other = grad_scale, Qn, Qp
+        if num_bits == 1:
+            q_w = input.sign()
+        else:
+            q_w = (input / alpha).round().clamp(Qn, Qp)
+        w_q = q_w * alpha
+        return w_q
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        if ctx.num_bits == 32:
+            return grad_output, None, None, None
+
+        input_, alpha = ctx.saved_tensors
+        grad_scale, Qn, Qp = ctx.other
+        q_w = input_ / alpha
+        indicate_small = (q_w < Qn).float()
+        indicate_big = (q_w > Qp).float()
+        indicate_middle = 1.0 - indicate_small - indicate_big  # this is more cpu-friendly than torch.ones(input_.shape)
+        if ctx.num_bits == 1:
+            grad_alpha = ((input_.sign()) * grad_output * grad_scale).sum().unsqueeze(dim=0)
+        else:
+            grad_alpha = ((indicate_small * Qn + indicate_big * Qp + indicate_middle * (
+                    -q_w + q_w.round())) * grad_output * grad_scale).sum().unsqueeze(dim=0)
+        grad_input = indicate_middle * grad_output
+        return grad_input, grad_alpha, None, None
+
+
+class ElasticQuantBinarizerUnsigned(torch.autograd.Function):
+    """
+        Modified from Learned Step-size Quantization.
+        https://arxiv.org/abs/1902.08153
+    """
+
+    @staticmethod
+    def forward(ctx, input, alpha, num_bits, layerwise):
+        """
+        :param input: input to be quantized
+        :param alpha: the step size
+        :param num_bits: quantization bits
+        :param layerwise: rowwise quant
+        :return: quantized output
+        """
+        if not layerwise:
+            # TODO
+            raise NotImplementedError
+        ctx.num_bits = num_bits
+        if num_bits == 32:
+            return input
+
+        Qn = 0
+        Qp = 2 ** (num_bits) - 1
+        if num_bits == 1:
+            input_ = input
+        else:
+            min_val = input.min().item()
+            input_ = input - min_val
+
+        eps = torch.tensor(0.00001).float().to(alpha.device)
+        if alpha.item() == 1.0 and (not alpha.initialized):
+            alpha.initialize_wrapper(input, num_bits, symmetric=False, init_method='default')
+        alpha = torch.where(alpha > eps, alpha, eps)
+        assert alpha > 0, 'alpha = {:.6f} becomes non-positive'.format(alpha)
+
+        grad_scale = 1.0 / math.sqrt(input.numel() * Qp)
+        ctx.save_for_backward(input_, alpha)
+        ctx.other = grad_scale, Qn, Qp
+        q_w = (input_ / alpha).round().clamp(Qn, Qp)
+        w_q = q_w * alpha
+        if num_bits != 1:
+            w_q = w_q + min_val
+        return w_q
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        if ctx.num_bits == 32:
+            return grad_output, None, None, None
+
+        input_, alpha = ctx.saved_tensors
+        grad_scale, Qn, Qp = ctx.other
+        q_w = input_ / alpha
+        indicate_small = (q_w < Qn).float()
+        indicate_big = (q_w > Qp).float()
+        indicate_middle = 1.0 - indicate_small - indicate_big  # this is more cpu-friendly than torch.ones(input_.shape)
+        grad_alpha = ((indicate_small * Qn + indicate_big * Qp + indicate_middle * (
+                -q_w + q_w.round())) * grad_output * grad_scale).sum().unsqueeze(dim=0)
+        grad_input = indicate_middle * grad_output
+        return grad_input, grad_alpha, None, None
+
+
+class AlphaInit(nn.Parameter):
+    def __init__(self, tensor):
+        super(AlphaInit, self).__new__(nn.Parameter, data=tensor)
+        self.initialized = False
+
+    def _initialize(self, init_tensor):
+        assert not self.initialized, 'already initialized.'
+        self.data.copy_(init_tensor)
+        self.initialized = True
+
+    def initialize_wrapper(self, tensor, num_bits, symmetric, init_method='default'):
+        Qp = 2 ** (num_bits - 1) - 1 if symmetric else 2 ** (num_bits) - 1
+        if Qp == 0:
+            Qp = 1.0
+        if init_method == 'default':
+            init_val = 2 * tensor.abs().mean() / math.sqrt(Qp) if symmetric else 4 * tensor.abs().mean() / math.sqrt(Qp)
+        elif init_method == 'uniform':
+            init_val = 1. / (2 * Qp + 1) if symmetric else 1. / Qp
+
+        self._initialize(init_val)
+
+
+class BwnQuantizer(torch.autograd.Function):
+    """Binary Weight Network (BWN)
+     Ref: https://arxiv.org/abs/1603.05279
+     """
+
+    @staticmethod
+    def forward(ctx, input, clip_val, num_bits, layerwise):
+        """
+        :param input: tensor to be binarized
         :return: quantized tensor
         """
-        ctx.save_for_backward(input, clip_val)
-        input = torch.where(input < clip_val[1], input, clip_val[1])
-        input = torch.where(input > clip_val[0], input, clip_val[0])
+        ctx.save_for_backward(input)
         if layerwise:
-            max_input = torch.max(torch.abs(input)).expand_as(input)
+            s = input.size()
+            m = input.norm(p=1).div(input.nelement())
+            e = input.mean()
+            result = (input - e).sign().mul(m.expand(s))
         else:
-            if input.ndimension() <= 3:
-                max_input = torch.max(torch.abs(input), dim=-1, keepdim=True)[0].expand_as(input).detach()
-            elif input.ndimension() == 4:
-                tmp = input.view(input.shape[0], input.shape[1], -1)
-                max_input = torch.max(torch.abs(tmp), dim=-1, keepdim=True)[0].unsqueeze(-1).expand_as(input).detach()
-            else:
-                raise ValueError
-        s = (2 ** (num_bits - 1) - 1) / max_input
-        output = torch.round(input * s).div(s)
+            n = input[0].nelement()  # W of size axb, return a vector of  ax1
+            s = input.size()
+            m = input.norm(1, 1, keepdim=True).div(n)
+            e = input.mean()
+            result = (input - e).sign().mul(m.expand(s))
 
-        return output
+        return result
 
     @staticmethod
     def backward(ctx, grad_output):
         """
-        :param ctx: saved non-clipped bin_kd-precision tensor and clip_val
+        :param ctx: saved non-clipped full-precision tensor and clip_val
         :param grad_output: gradient ert the quantized tensor
-        :return: estimated gradient wrt the bin_kd-precision tensor
+        :return: estimated gradient wrt the full-precision tensor
         """
-        input, clip_val = ctx.saved_tensors  # unclipped input
         grad_input = grad_output.clone()
-        grad_input[input.ge(clip_val[1])] = 0
-        grad_input[input.le(clip_val[0])] = 0
-        return grad_input, None, None, None, None
+        return grad_input, None, None, None
+
+
+def act_quant_fn(input, clip_val, num_bits, symmetric, quant_method, layerwise):
+    if num_bits == 32:
+        return input
+    elif quant_method == "bwn" and num_bits == 1:
+        quant_fn = BwnQuantizer
+    elif quant_method == "elastic" and num_bits >= 1 and symmetric:
+        quant_fn = ElasticQuantBinarizerSigned
+    elif quant_method == "elastic" and num_bits >= 1 and not symmetric:
+        quant_fn = ElasticQuantBinarizerUnsigned
+    else:
+        raise ValueError("Unknownquant_method")
+
+    input = quant_fn.apply(input, clip_val, num_bits, layerwise)
+
+    return input
+
+
+def weight_quant_fn(weight, clip_val, num_bits, symmetric, quant_method, layerwise):
+    if num_bits == 32:
+        return weight
+    elif quant_method == "bwn" and num_bits == 1:
+        quant_fn = BwnQuantizer
+    else:
+        raise ValueError("Unknown quant_method")
+
+    weight = quant_fn.apply(weight, clip_val, num_bits, layerwise)
+    return weight
 
 
 class QuantizeLinear(nn.Linear):
-    def __init__(self, *kargs, config=None):
-        super(QuantizeLinear, self).__init__(*kargs, bias=True)
-        self.quantize_act = config.quantize_act
-        self.weight_bits = config.weight_bits
 
-        # 用可学习的修正因子效果不如均值和斜率
-        # self.weight_k = nn.Parameter(torch.rand(size=(self.weight.size()[0], 1)), requires_grad=True).to(config.device)
-        # self.input_k = nn.Parameter(torch.Tensor([0.5]), requires_grad=True).to(config.device)
+    def __init__(self, *kargs, clip_val=2.5, weight_bits=8, input_bits=8, learnable=False, symmetric=True,
+                 weight_layerwise=True, input_layerwise=True, weight_quant_method="twn", input_quant_method="uniform",
+                 **kwargs):
+        super(QuantizeLinear, self).__init__(*kargs, **kwargs)
+        self.weight_bits = weight_bits
+        self.input_bits = input_bits
+        self.learnable = learnable
+        self.symmetric = symmetric
+        self.weight_layerwise = weight_layerwise
+        self.input_layerwise = input_layerwise
+        self.weight_quant_method = weight_quant_method
+        self.input_quant_method = input_quant_method
+        self._build_weight_clip_val(weight_quant_method, learnable, init_val=clip_val)
+        self._build_input_clip_val(input_quant_method, learnable, init_val=clip_val)
+        self.move = LearnableBias(self.weight.shape[1])
 
-        if self.weight_bits == 1:
-            self.weight_quantizer = BinaryQuantizer
+    def _build_weight_clip_val(self, quant_method, learnable, init_val):
+        if quant_method == 'elastic':
+            assert learnable, 'Elastic method must use leranable step size!'
+            self.weight_clip_val = AlphaInit(torch.tensor(1.0))  # stepsize will be initialized in the first quantization
         else:
-            self.weight_quantizer = SymQuantizer
-        self.register_buffer('weight_clip_val', torch.tensor([-config.clip_val, config.clip_val]))
-        self.init = True
+            self.register_buffer('weight_clip_val', None)
 
-        if self.quantize_act:
-            self.input_bits = config.input_bits
-            if self.input_bits == 1:
-                self.act_quantizer = BinaryQuantizer
-            else:
-                self.act_quantizer = SymQuantizer
-            self.register_buffer('act_clip_val', torch.tensor([-config.clip_val, config.clip_val]))
-        self.register_parameter('scale', Parameter(torch.Tensor([0.0, ]).squeeze()))
-
-    def forward(self, input, type=None):
-        if self.weight_bits == 1:
-            scaling_factor = torch.mean(abs(self.weight), dim=1, keepdim=True)
-            scaling_factor = scaling_factor.detach()
-            real_weights = self.weight - torch.mean(self.weight, dim=-1, keepdim=True)
-            binary_weights_no_grad = torch.sign(real_weights) * scaling_factor
-            # binary_weights_no_grad = self.weight_quantizer.apply(real_weights) * scaling_factor
-            cliped_weights = torch.clamp(real_weights, -1.0, 1.0)
-            weight = binary_weights_no_grad.detach() - cliped_weights.detach() + cliped_weights
+    def _build_input_clip_val(self, quant_method, learnable, init_val):
+        if quant_method == 'elastic' or quant_method == 'bwn':
+            assert learnable, 'Elastic method must use leranable step size!'
+            self.input_clip_val = AlphaInit(torch.tensor(1.0))  # stepsize will be initialized in the first quantization
         else:
-            weight = self.weight_quantizer.apply(self.weight, self.weight_clip_val, self.weight_bits, True)
+            self.register_buffer('input_clip_val', None)
 
-        if self.input_bits == 1:
-            k = (torch.max(input) - torch.min(input)) / input.size()[1]
-            binary_input_no_grad = torch.sign(input)
-            # binary_input_no_grad = self.act_quantizer.apply(input)
-            cliped_input = torch.clamp(input, -1.0, 1.0)
-            ba = binary_input_no_grad.detach() - cliped_input.detach() + cliped_input
-        else:
-            ba = self.act_quantizer.apply(input, self.act_clip_val, self.input_bits, True)
-
-        out = nn.functional.linear(ba, weight) * k
-
+    def forward(self, input):
+        # quantize weight
+        weight = weight_quant_fn(self.weight, self.weight_clip_val, num_bits=self.weight_bits, symmetric=self.symmetric,
+                                 quant_method=self.weight_quant_method, layerwise=self.weight_layerwise)
+        # quantize input
+        input = self.move(input)
+        input = act_quant_fn(input, self.input_clip_val, num_bits=self.input_bits, symmetric=self.symmetric,
+                             quant_method=self.input_quant_method, layerwise=self.input_layerwise)
+        out = nn.functional.linear(input, weight)
         if not self.bias is None:
             out += self.bias.view(1, -1).expand_as(out)
+
+        return out
+
+
+class QuantizeEmbedding(nn.Embedding):
+
+    def __init__(self, *kargs, clip_val=2.5, weight_bits=8, learnable=False, symmetric=True,
+                 embed_layerwise=False, weight_quant_method="twn", **kwargs):
+        super(QuantizeEmbedding, self).__init__(*kargs, **kwargs)
+        self.weight_bits = weight_bits
+        self.learnable = learnable
+        self.symmetric = symmetric
+        self.embed_layerwise = embed_layerwise
+        self.weight_quant_method = weight_quant_method
+        self._build_embed_clip_val(weight_quant_method, learnable, init_val=clip_val)
+
+    def _build_embed_clip_val(self, quant_method, learnable, init_val):
+        if quant_method == 'uniform':
+            self.register_buffer('embed_clip_val', torch.tensor([-init_val, init_val]))
+            if learnable:
+                self.embed_clip_val = nn.Parameter(self.embed_clip_val)
+        elif quant_method == 'elastic':
+            assert learnable, 'Elastic method must use leranable step size!'
+            self.embed_clip_val = AlphaInit(torch.tensor(1.0))  # stepsize will be initialized in the first quantization
+        else:
+            self.register_buffer('embed_clip_val', None)
+
+    def forward(self, input):
+        weight = weight_quant_fn(self.weight, self.embed_clip_val, num_bits=self.weight_bits, symmetric=self.symmetric,
+                                 quant_method=self.weight_quant_method, layerwise=self.embed_layerwise)
+
+        out = nn.functional.embedding(
+            input, weight, self.padding_idx, self.max_norm,
+            self.norm_type, self.scale_grad_by_freq, self.sparse)
 
         return out

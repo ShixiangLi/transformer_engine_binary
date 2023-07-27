@@ -36,26 +36,50 @@ class Model(PreTrainedModel):
         self.outer = ModelOutput(config)
         self.apply(self.init_weights)
 
-    def forward(self, input_ids, attention_mask=None):
+    def forward(self, input_ids, attention_mask=None, output_all_encoded_layers=True, output_att=True):
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
 
-        # extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-        extended_attention_mask = attention_mask.to(dtype=next(self.parameters()).dtype)  # fp16 compatibility
-        # extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+        extended_attention_mask = attention_mask.unsqueeze(1)
+        extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype)  # fp16 compatibility
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
 
         embedding_output = self.embeddings(input_ids)
-        encoded_layers, attention_scores, value_scores, context_scores, query_scores, key_scores = self.encoder(embedding_output, extended_attention_mask)
+        encoded_layers, layer_atts, layer_atto = self.encoder(embedding_output, extended_attention_mask)
 
         output = self.outer(encoded_layers[-1])
-        return encoded_layers, attention_scores, output, value_scores, context_scores, query_scores, key_scores
-        # return output
+        return encoded_layers, layer_atts, output, layer_atto
 
 
 if __name__ == '__main__':
-    config = ModelConfig()
+    config = ModelConfig(
+        num_attention_heads=4,
+        hidden_size=16,
+        input_bits=1,
+        clip_init_val=2.5,
+        quantize_act=True,
+        weight_bits=1,
+        attention_probs_dropout_prob=0.1,
+        layer_norm_eps=1e-12,
+        hidden_dropout_prob=0.1,
+        intermediate_size=64,
+        num_hidden_layers=6,
+        time_steps=30,
+        max_position_embeddings=30,
+        en_dropout=0.1,
+        initializer_range=0.02,
+        device='cpu',
+        weight_layerwise=True,
+        input_layerwise=True,
+        weight_quant_method='bwn',
+        input_quant_method='bwn',
+        learnable_scaling=True,
+        sym_quant_qkvo=True,
+        sym_quant_ffn_attn=True,
+        hidden_act='relu'
+    )
     model = Model(config)
-    hidden_state = torch.rand(size=(10196, 30, 15))
-    hidden_mask = torch.ones(size=(10196, 1, 30))
-    encoded_layers, attention_scores, output, value_scores, context_scores, query_scores, key_scores = model(
-        hidden_state, hidden_mask)
+    hidden_state = torch.rand(size=(1, 30, 16))
+    hidden_mask = torch.ones(size=(1, 1, 30))
+    encoded_layers, layer_atts, output = model(hidden_state, hidden_mask)
+    print(output)

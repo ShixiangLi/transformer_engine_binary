@@ -150,6 +150,7 @@ def run_epoch(
         mode="train",
         accum_iter=1,
         train_state=TrainState(),
+        epoch=0
 ):
     """
     进行一个epoch训练
@@ -164,6 +165,7 @@ def run_epoch(
     accum_iter: 多少个batch更新一次参数，默认为1，也就是每个batch都对参数进行更新
     train_state: TrainState对象，用于保存一些训练状态
     """
+    model.train()
     start = time.time()
     total_loss = 0
     n_accum = 0  # 本次epoch更新了多少次模型参数
@@ -171,7 +173,7 @@ def run_epoch(
         # 前向传递。等价于model(batch.src, batch.tgt, batch.src_mask, batch.tgt_mask)
         # 但注意，这里的out是Decoder的输出，并不是Generator的输出，因为在EncoderDecoder
         # 的forward中并没有使用generator。generator的调用放在了loss_compute中
-        _, _, out, _, _, _, _ = model.forward(batch.src.to(device), batch.src_mask.to(device))
+        encoded_layers, layer_atts, output = model.forward(batch.src.to(device), batch.src_mask.to(device))
 
         """
         计算损失，传入的三个参数分别为：
@@ -182,7 +184,7 @@ def run_epoch(
         返回两个loss，其中loss_node是正则化之后的，所以梯度下降时用这个。
                     而loss是未进行正则化的，用于统计total_loss。
         """
-        loss = loss_compute(out, batch.tgt.to(device))
+        loss = loss_compute(output, batch.tgt.to(device))
         loss_node = loss
         if mode == "train" or mode == "train+log":
             # 计算梯度
@@ -215,13 +217,13 @@ def run_epoch(
             # 打印日志
             print(
                 (
-                        "Epoch Step: %6d | Accumulation Step: %3d | Loss: %.5f "
+                        "Epoch : %d | Epoch Step: %6d | Accumulation Step: %3d | Loss: %.5f "
                         + "| Sec: %4.2f | Learning Rate: %6.1e"
                 )
                 # i: 本次epoch的第几个batch
                 # n_accum: 本次epoch更新了多少次模型参数
                 # lr: 学习率（learning rate），这里打印学习率的目的是看一下warmup下学习率的变化
-                % (i, n_accum, torch.sqrt(loss)*125, elapsed, lr)
+                % (epoch, i, n_accum, torch.sqrt(loss) * 125, elapsed, lr)
             )
             # 重置开始时间
             start = time.time()
@@ -243,42 +245,50 @@ def run_distill_epoch(
         mode="train",
         accum_iter=1,
         train_state=TrainState(),
+        epoch=0,
 ):
     start = time.time()
     total_loss = 0.
-    # rep_loss = 0.
-    n_accum = 0  # 本次epoch更新了多少次模型参数
+    n_accum = 0
+
     for i, batch in enumerate(data_iter):
-        student_logits, student_score, student_reps, student_values, student_context, student_queries, student_keys = student_model.forward(
-            batch.src.to(device), batch.src_mask.to(device))
+
+        student_model.train()
+        teacher_model.train()
+
+        att_loss = 0.
+        rep_loss = 0.
+        rep_loss_layerwise = []
+        att_loss_layerwise = []
+
+        feature, feature_mask, labels = batch.src.to(device), batch.src_mask.to(device), batch.tgt.to(device)
+
+        student_reps, student_atts, student_out = student_model(feature, feature_mask)
+
         with torch.no_grad():
-            teacher_logits, teacher_score, teacher_reps, teacher_values, teacher_context, teacher_queries, teacher_keys = teacher_model.forward(
-                batch.src.to(device), batch.src_mask.to(device))
+            teacher_reps, teacher_atts, teacher_out = teacher_model(feature, feature_mask)
 
-        teacher_layer_num = len(teacher_values)
-        student_layer_num = len(student_values)
-        assert teacher_layer_num % student_layer_num == 0
+        loss = 0.
 
-        layers_per_block = int(teacher_layer_num / student_layer_num)
+        hard_loss = loss_compute(student_out, labels)
+        loss += hard_loss
 
-        loss = loss_compute(student_reps, teacher_reps)
+        for student_att, teacher_att in zip(student_atts, teacher_atts):
+            student_att = torch.where(student_att <= -1e2, torch.zeros_like(student_att).to(device), student_att)
+            teacher_att = torch.where(teacher_att <= -1e2, torch.zeros_like(teacher_att).to(device), teacher_att)
 
-        query_loss = direction_matching_distillation(student_queries, teacher_queries, layers_per_block,
-                                                     student_layer_num, device)
-        loss += query_loss
+            tmp_loss = torch.nn.MSELoss()(student_att, teacher_att)
+            att_loss += tmp_loss
+            att_loss_layerwise.append(tmp_loss.item())
 
-        key_loss = direction_matching_distillation(student_keys, teacher_keys, layers_per_block,
-                                                     student_layer_num, device)
-        loss += key_loss
+        ii = 0
+        for student_rep, teacher_rep in zip(student_reps, teacher_reps):
+            if ii == 6:
+                tmp_loss = torch.nn.MSELoss()(student_rep, teacher_rep)
+                rep_loss += tmp_loss
+                rep_loss_layerwise.append(tmp_loss.item())
 
-        value_loss = direction_matching_distillation(student_values, teacher_values, layers_per_block,
-                                                     student_layer_num, device)
-        loss += value_loss
-
-        # new_teacher_reps = [teacher_reps[i * layers_per_block] for i in range(student_layer_num + 1)]
-        # teacher_reps = new_teacher_reps
-        # for student_rep, teacher_rep in zip(student_reps, teacher_reps):
-        #     rep_loss += att_loss_r2b(student_rep, teacher_rep)
+        # loss += att_loss
         # loss += rep_loss
 
         if mode == "train" or mode == "train+log":
@@ -312,21 +322,15 @@ def run_distill_epoch(
             # 打印日志
             print(
                 (
-                        "Epoch Step: %6d | Accumulation Step: %3d | Loss: %.5f "
+                        "Epoch: %d | Epoch Step: %6d | Accumulation Step: %3d | Loss: %.5f "
                         + "| Sec: %4.2f | Learning Rate: %6.1e"
                 )
                 # i: 本次epoch的第几个batch
                 # n_accum: 本次epoch更新了多少次模型参数
                 # lr: 学习率（learning rate），这里打印学习率的目的是看一下warmup下学习率的变化
-                % (i, n_accum, torch.sqrt(loss)*125, elapsed, lr)
+                % (epoch, i, n_accum, torch.sqrt(loss) * 125, elapsed, lr)
             )
             # 重置开始时间
             start = time.time()
-
-        del loss
-        del key_loss
-        del query_loss
-        del value_loss
-        # del rep_loss
         # 返回正则化之后的total_loss，返回训练状态
     return total_loss / (i + 1), train_state

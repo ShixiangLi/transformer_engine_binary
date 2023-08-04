@@ -173,7 +173,7 @@ def run_epoch(
         # 前向传递。等价于model(batch.src, batch.tgt, batch.src_mask, batch.tgt_mask)
         # 但注意，这里的out是Decoder的输出，并不是Generator的输出，因为在EncoderDecoder
         # 的forward中并没有使用generator。generator的调用放在了loss_compute中
-        encoded_layers, layer_atts, output = model.forward(batch.src.to(device), batch.src_mask.to(device))
+        encoded_layers, layer_atts, output, layer_atto = model.forward(batch.src.to(device), batch.src_mask.to(device))
 
         """
         计算损失，传入的三个参数分别为：

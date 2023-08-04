@@ -82,7 +82,7 @@ if mode == 'train':
     )
     model = Model(config).to(device)
     criterion = nn.MSELoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.005)
     lr_scheduler = StepLR(optimizer, step_size=1200, gamma=0.1)
 
     for epoch in range(epochs):

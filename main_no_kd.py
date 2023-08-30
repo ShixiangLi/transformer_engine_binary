@@ -140,7 +140,7 @@ if mode == 'train':
     feature_mask = torch.ones(size=(feature.size(0), 1, seq_len))
     labels = torch.tensor(labels)
     with torch.no_grad():
-        encoded_layers, layer_atts, output = model.forward(feature.to(device), feature_mask.to(device))
+        encoded_layers, layer_atts, output, layer_atto = model.forward(feature.to(device), feature_mask.to(device))
     out = torch.clamp(output, max=1, min=0)
     print(math.sqrt(nn.MSELoss()(out.to(device), labels.to(device))) * 125)
     plt.plot(out.to('cpu').detach().numpy())
